@@ -1,75 +1,39 @@
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
-from transformers import (
-    AutoTokenizer, 
-    AutoModel,
-    TrainingArguments,
-    Trainer,
-    DataCollatorWithPadding
-)
+from torch.utils.data import Dataset
+from sentence_transformers import SentenceTransformer, InputExample, losses
+from sentence_transformers.evaluation import EmbeddingSimilarityEvaluator
+from sentence_transformers.trainer import SentenceTransformerTrainer
+from sentence_transformers.training_args import SentenceTransformerTrainingArguments
 import numpy as np
 from sklearn.model_selection import train_test_split
 import os
 import logging
+import random
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class EmbeddingDataset(Dataset):
-    def __init__(self, texts, tokenizer, max_length=512):
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+def create_training_examples(texts, num_pairs_per_text=3):
+    """
+    Create training examples for contrastive learning
+    """
+    examples = []
     
-    def __len__(self):
-        return len(self.texts)
+    for i, text in enumerate(texts):
+        # Create positive pairs (same text with slight variations or duplicates)
+        examples.append(InputExample(texts=[text, text], label=1.0))
+        
+        # Create negative pairs (different texts)
+        for _ in range(num_pairs_per_text):
+            # Random negative example
+            neg_idx = random.randint(0, len(texts) - 1)
+            while neg_idx == i:
+                neg_idx = random.randint(0, len(texts) - 1)
+            
+            examples.append(InputExample(texts=[text, texts[neg_idx]], label=0.0))
     
-    def __getitem__(self, idx):
-        text = str(self.texts[idx])
-        
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-        
-        return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'labels': encoding['input_ids'].flatten()
-        }
-
-class EmbeddingModel(torch.nn.Module):
-    def __init__(self, model_name):
-        super().__init__()
-        self.model = AutoModel.from_pretrained(model_name)
-        self.config = self.model.config
-        
-    def forward(self, input_ids, attention_mask=None, labels=None):
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        
-        # Mean pooling
-        last_hidden_states = outputs.last_hidden_state
-        attention_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_states.size()).float()
-        sum_embeddings = torch.sum(last_hidden_states * attention_mask_expanded, 1)
-        sum_mask = torch.clamp(attention_mask_expanded.sum(1), min=1e-9)
-        embeddings = sum_embeddings / sum_mask
-        
-        loss = None
-        if labels is not None:
-            # Contrastive learning loss can be implemented here
-            # For now, using MSE as a simple reconstruction loss
-            reconstructed = self.model.get_input_embeddings()(labels)
-            loss = torch.nn.functional.mse_loss(embeddings, reconstructed.mean(dim=1))
-        
-        return {
-            'loss': loss,
-            'embeddings': embeddings,
-            'last_hidden_state': last_hidden_states
-        }
+    return examples
 
 def load_and_preprocess_data(csv_path):
     """Load and preprocess the CSV data"""
@@ -83,6 +47,11 @@ def load_and_preprocess_data(csv_path):
     # Remove very short texts
     texts = [text for text in texts if len(text.strip()) > 10]
     
+    # Limit to reasonable size for training
+    if len(texts) > 10000:
+        texts = texts[:10000]
+        logger.info(f"Limited to first 10000 texts for training efficiency")
+    
     logger.info(f"Loaded {len(texts)} text samples")
     return texts
 
@@ -90,8 +59,8 @@ def main():
     # Configuration
     MODEL_NAME = "google/embeddinggemma-300m"
     CSV_PATH = "output_unsupervised.csv"
-    OUTPUT_DIR = "./finetune_results"
-    MAX_LENGTH = 8192
+    OUTPUT_DIR = "./finetune_results_sbert"
+    MAX_SEQ_LENGTH = 8192
     
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -100,30 +69,24 @@ def main():
     # Load data
     texts = load_and_preprocess_data(CSV_PATH)
     
-    # Split data
-    train_texts, val_texts = train_test_split(texts, test_size=0.2, random_state=42)
-    logger.info(f"Train samples: {len(train_texts)}, Validation samples: {len(val_texts)}")
+    # Create training examples
+    logger.info("Creating training examples...")
+    training_examples = create_training_examples(texts, num_pairs_per_text=2)
     
-    # Initialize tokenizer and model
-    logger.info(f"Loading tokenizer and model: {MODEL_NAME}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # Split examples
+    train_examples, val_examples = train_test_split(training_examples, test_size=0.2, random_state=42)
+    logger.info(f"Train examples: {len(train_examples)}, Validation examples: {len(val_examples)}")
     
-    # Add padding token if not present
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Initialize model
+    logger.info(f"Loading SentenceTransformer model: {MODEL_NAME}")
+    model = SentenceTransformer(MODEL_NAME, device=device)
+    model.max_seq_length = MAX_SEQ_LENGTH
     
-    model = EmbeddingModel(MODEL_NAME)
-    model.to(device)
+    # Define loss function
+    train_loss = losses.CosineSimilarityLoss(model)
     
-    # Create datasets
-    train_dataset = EmbeddingDataset(train_texts, tokenizer, MAX_LENGTH)
-    val_dataset = EmbeddingDataset(val_texts, tokenizer, MAX_LENGTH)
-    
-    # Data collator
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    
-    # Training arguments
-    training_args = TrainingArguments(
+    # Training arguments with your specified parameters
+    args = SentenceTransformerTrainingArguments(
         output_dir=OUTPUT_DIR,
         overwrite_output_dir=False,
         do_predict=False,
@@ -245,18 +208,17 @@ def main():
         save_steps=500,
         eval_steps=500,
         save_strategy="steps",
-        run_name="embeddinggemma-finetune",
+        run_name="embeddinggemma-finetune-sbert",
         report_to=None,
     )
     
-    # Initialize trainer
-    trainer = Trainer(
+    # Create trainer
+    trainer = SentenceTransformerTrainer(
         model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
+        args=args,
+        train_dataset=train_examples,
+        eval_dataset=val_examples,
+        loss=train_loss,
     )
     
     # Train model
@@ -265,28 +227,27 @@ def main():
     
     # Save model
     logger.info("Saving model...")
-    trainer.save_model()
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    
-    # Evaluate model
-    logger.info("Evaluating model...")
-    eval_results = trainer.evaluate()
-    logger.info(f"Evaluation results: {eval_results}")
+    model.save(OUTPUT_DIR)
     
     # Test embedding generation
     logger.info("Testing embedding generation...")
-    test_text = texts[0][:200]  # Use first text sample
+    test_texts = texts[:5]  # Use first 5 text samples
     
-    model.eval()
-    with torch.no_grad():
-        inputs = tokenizer(test_text, return_tensors='pt', padding=True, truncation=True, max_length=MAX_LENGTH)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        outputs = model(**inputs)
-        embedding = outputs['embeddings']
-        logger.info(f"Generated embedding shape: {embedding.shape}")
-        logger.info(f"Sample embedding (first 10 dims): {embedding[0][:10].cpu().numpy()}")
+    embeddings = model.encode(test_texts)
+    logger.info(f"Generated embeddings shape: {embeddings.shape}")
+    logger.info(f"Expected output dimensions: 1024")
+    logger.info(f"Actual output dimensions: {embeddings.shape[1]}")
+    logger.info(f"Sample embedding (first 10 dims): {embeddings[0][:10]}")
+    
+    # Test similarity
+    if len(test_texts) >= 2:
+        similarity = model.similarity(embeddings[0], embeddings[1])
+        logger.info(f"Similarity between first two texts: {similarity.item():.4f}")
     
     logger.info("Fine-tuning completed successfully!")
+    logger.info(f"Model saved to: {OUTPUT_DIR}")
+    logger.info(f"Maximum sequence length: {MAX_SEQ_LENGTH} tokens")
+    logger.info(f"Output dimensionality: {embeddings.shape[1]} dimensions")
 
 if __name__ == "__main__":
     main()
